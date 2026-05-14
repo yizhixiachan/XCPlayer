@@ -104,7 +104,7 @@ XCPlayer 是一款面向 Windows 桌面的本地音视频播放器，基于 Qt Q
 本项目为开源项目，作者利用业余时间开发。如果你觉得 XCPlayer 对你有帮助，欢迎支持作者！
 
 <div align="center">
-  <img src="assets/pay.jpg?raw=true" width="280" alt="赞助二维码">
+  <img src="images/pay.jpg?raw=true" width="280" alt="赞助二维码">
   <p>微信 / 支付宝扫码赞助</p>
 </div>
 
