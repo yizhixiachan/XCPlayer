@@ -5,8 +5,6 @@ project(XCPlayer VERSION 0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-7.1.1")
 
 find_package(Qt6 REQUIRED COMPONENTS Quick Sql QuickControls2)
@@ -84,15 +82,12 @@ target_link_libraries(appXCPlayer PRIVATE
     Qt6::Sql
     Qt6::QuickControls2
 
-    ${FFMPEG_DIR}/lib/avcodec.lib
-    ${FFMPEG_DIR}/lib/avfilter.lib
-    ${FFMPEG_DIR}/lib/avformat.lib
-    ${FFMPEG_DIR}/lib/avutil.lib
-    ${FFMPEG_DIR}/lib/swresample.lib
-    ${FFMPEG_DIR}/lib/swscale.lib
-
-    d3d11
-    dxgi
+    ${FFMPEG_DIR}/lib/libavcodec.dll.a
+    ${FFMPEG_DIR}/lib/libavfilter.dll.a
+    ${FFMPEG_DIR}/lib/libavformat.dll.a
+    ${FFMPEG_DIR}/lib/libavutil.dll.a
+    ${FFMPEG_DIR}/lib/libswresample.dll.a
+    ${FFMPEG_DIR}/lib/libswscale.dll.a
 
     winmm
     Avrt

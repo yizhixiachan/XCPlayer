@@ -1,7 +1,6 @@
 #include "MediaTool.h"
 #include <filesystem>
 #include <regex>
-#include <QHash>
 #include <QFileInfo>
 extern "C"
 {
@@ -20,6 +19,39 @@ static int Callback(void* opaque)
     if(bStopReq && bStopReq->load(std::memory_order_acquire)) return 1;
     return 0;
 }
+
+static std::filesystem::path ToFsPath(const QString& path)
+{
+#ifdef Q_OS_WIN
+    return std::filesystem::path(path.toStdWString());
+#else
+    return std::filesystem::path(path.toStdString());
+#endif
+}
+
+static bool IsRegularFile(const QString &path)
+{
+    std::error_code ec;
+    const auto fsPath = ToFsPath(path);
+    return std::filesystem::exists(fsPath, ec) && std::filesystem::is_regular_file(fsPath, ec);
+}
+
+static bool CoverMimeFromCodec(AVCodecID codecId, QByteArray& mime)
+{
+    switch(codecId) {
+    case AV_CODEC_ID_PNG:
+        mime = "image/png";
+        return true;
+
+    case AV_CODEC_ID_MJPEG:
+        mime = "image/jpeg";
+        return true;
+
+    default:
+        return false;
+    }
+}
+
 
 XC::BaseInfo MediaTool::ExtractBaseInfo(AVFormatContext *ic)
 {
@@ -537,16 +569,13 @@ QImage MediaTool::ExtractVideoFrame(const QString &url, std::atomic<bool> &stopF
     pkt = av_packet_alloc();
     if(!frame || !pkt) goto cleanup;
 
-    static int max_ = 0;
     // 循环读取和解码，直到找到一个真正的 I 帧
     while(!gotFrame && maxAttempts-- > 0 && av_read_frame(ic, pkt) >= 0) {
         if(pkt->stream_index == videoStreamIdx) {
             if(avcodec_send_packet(codecCtx, pkt) == 0) {
                 while(avcodec_receive_frame(codecCtx, frame) == 0) {
-                    // 检查该帧是否为 I 帧 (关键帧)
-                    // TS 文件在 seek 后如果拿到 P/B 帧，这里会过滤掉，直到遇到 I 帧
-                    // MP4 文件 seek 后通常直接就是 I 帧，直接通过
-                    if (frame->pict_type == AV_PICTURE_TYPE_I) {
+                    // 检查该帧是否为 I 帧
+                    if(frame->pict_type == AV_PICTURE_TYPE_I) {
                         if (frame->width > 0 && frame->height > 0 && frame->format != AV_PIX_FMT_NONE) {
                             gotFrame = true;
                             break;
@@ -558,8 +587,7 @@ QImage MediaTool::ExtractVideoFrame(const QString &url, std::atomic<bool> &stopF
         av_packet_unref(pkt);
     }
 
-    // 如果尝试了1200次还没找到 I 帧（极其罕见的损坏文件），
-    // 只要能解码出任何有效的帧，我们就勉强接受，防止完全没图
+    // 如果尝试了1200次还没找到 I 帧，就勉强接受该帧
     if(!gotFrame && frame->width > 0 && frame->format != AV_PIX_FMT_NONE) {
         gotFrame = true;
     }
@@ -611,274 +639,201 @@ cleanup:
 
 bool MediaTool::ModifyMetadata(const QString &inputUrl, const QString &outputUrl, const QMap<QString, QString> &metadata, QString& error, std::atomic<bool> &stopFlag)
 {
-    auto getError = [](int ret) {
-        char errbuf[1024] = {0};
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        return QString::fromUtf8(errbuf);
-    };
-
-    std::filesystem::path inputPath;
-#ifdef Q_OS_WIN
-    inputPath = inputUrl.toStdWString();
-#else
-    inputPath = inputUrl.toStdString();
-#endif
-
-    std::error_code ec;
-    if(!std::filesystem::exists(inputPath, ec) || !std::filesystem::is_regular_file(inputPath, ec)) {
+    if(!IsRegularFile(inputUrl)) {
         error = "无效文件";
         return false;
     }
 
-    // 1. 确定工作模式与路径
-    bool inPlace = outputUrl.trimmed().isEmpty() || outputUrl == inputUrl;
+    const bool inPlace = outputUrl.trimmed().isEmpty() || outputUrl == inputUrl;
 
     QFileInfo fi(inputUrl);
     QString finalOutUrl = outputUrl;
     if(inPlace) {
-        QString ext = fi.suffix().isEmpty() ? ".tmp" : ("." + fi.suffix());
+        const QString ext = fi.suffix().isEmpty() ? ".tmp" : "." + fi.suffix();
         finalOutUrl = fi.absolutePath() + "/" + fi.completeBaseName() + "_tmp" + ext;
     }
 
     AVFormatContext* ic = nullptr;
     AVFormatContext* oc = nullptr;
     AVPacket* pkt = nullptr;
+
+    QList<int> streamMapping;
+    int outStreamIndex = 0;
     bool success = true;
     int ret = 0;
 
-    // 用于记录输入流索引到输出流索引的映射。-1表示该流被丢弃
-    QList<int> stream_mapping;
-    int out_stream_index = 0;
-
-    // [新增]: 智能应用元数据 Lambda，保留原有大小写键名 支持置空删除
-    auto applyFuzzyMeta = [](AVDictionary** dict, const QMap<QString, QString>& newMeta) {
-        for(auto it = newMeta.constBegin(); it != newMeta.constEnd(); ++it) {
-            QString targetKey = it.key();
-            QString val = it.value().trimmed(); // 去除首尾空格
-
-            AVDictionaryEntry* tag = nullptr;
-            bool found = false;
-
-            // 模糊查找原本是否存在这个字段，保留大小写
-            while((tag = av_dict_get(*dict, "", tag, AV_DICT_IGNORE_SUFFIX))) {
-                if(QString::fromUtf8(tag->key).compare(targetKey, Qt::CaseInsensitive) == 0) {
-                    targetKey = QString::fromUtf8(tag->key);
-                    found = true;
-                    break;
-                }
-            }
-            // 针对歌词特判 (可能是 lyrics-xxx 等变体)
-            if(!found && targetKey.compare("lyrics", Qt::CaseInsensitive) == 0) {
-                tag = nullptr;
-                while((tag = av_dict_get(*dict, "", tag, AV_DICT_IGNORE_SUFFIX))) {
-                    if(QString::fromUtf8(tag->key).startsWith("lyric", Qt::CaseInsensitive)) {
-                        targetKey = QString::fromUtf8(tag->key);
-                        found = true;
-                        break;
-                    }
-                }
-            }
-
-            // 【核心修改】：如果输入值为空，直接传入 nullptr 将其从文件中物理删除
-            if (val.isEmpty()) {
-                if (found) {
-                    av_dict_set(dict, targetKey.toUtf8().constData(), nullptr, 0);
-                }
-            } else {
-                av_dict_set(dict, targetKey.toUtf8().constData(), val.toUtf8().constData(), 0);
-            }
-        }
-    };
+    QByteArray preservedOggCover;
 
     ic = avformat_alloc_context();
+    if(!ic) {
+        error = "创建输入上下文失败";
+        return false;
+    }
+
     ic->interrupt_callback.callback = Callback;
     ic->interrupt_callback.opaque = &stopFlag;
 
     ret = avformat_open_input(&ic, inputUrl.toUtf8().constData(), nullptr, nullptr);
     if(ret < 0) {
-        error = QString("打开媒体文件失败：%1").arg(getError(ret));
+        error = QString("打开媒体文件失败：%1").arg(FFerror(ret));
+        avformat_free_context(ic);
         return false;
     }
-    stream_mapping.fill(-1, ic->nb_streams);
 
     ret = avformat_find_stream_info(ic, nullptr);
-    if (ret < 0) {
+    if(ret < 0) {
+        error = QString("读取流信息失败：%1").arg(FFerror(ret));
         avformat_close_input(&ic);
-        error = QString("读取流信息失败：%1").arg(getError(ret));
         return false;
     }
 
     ret = avformat_alloc_output_context2(&oc, nullptr, nullptr, finalOutUrl.toUtf8().constData());
-    if (!oc || ret < 0) {
+    if(!oc || ret < 0) {
         success = false;
-        error = QString("创建输出上下文失败：%1").arg(getError(ret));
-        goto cleanup_ffmpeg;
+        error = QString("创建输出上下文失败：%1").arg(FFerror(ret));
+        goto cleanup;
     }
 
     {
-        QString outFormatName  = QString::fromUtf8(oc->oformat->name).toLower();
-        bool isOggFamily = outFormatName.contains("ogg") || outFormatName.contains("oga") || outFormatName.contains("opus");
-        QString preservedBase64Cover;
+        const bool oggFamily = IsOggFamily(oc);
+        streamMapping.fill(-1, static_cast<int>(ic->nb_streams));
 
-        // 4. 复制流、编解码参数
-        for (unsigned int i = 0; i < ic->nb_streams; i++) {
-            AVStream *in_stream = ic->streams[i];
+        for(unsigned int i = 0; i < ic->nb_streams; ++i) {
+            AVStream* inStream = ic->streams[i];
 
-            if (in_stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
-                in_stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+            if(inStream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+                inStream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
                 continue;
             }
 
-            // 【关键修复】：OGG / OPUS 封装器不支持写入视频流（封面）
-            // 如果将封面的视频流强传给 OGG Muxer，会导致 avformat_write_header 返回 -22 (Invalid argument)。
-            // 因此对于 OGG 家族，我们拦截图片流，将其重新打包为 Base64，稍后通过 metadata 安全写入。
-            if (isOggFamily && in_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-                (in_stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            // OGG/Opus/Vorbis 不通过 video attached_pic 写封面。
+            // 如果 FFmpeg 把旧封面暴露成 attached_pic，这里转回 METADATA_BLOCK_PICTURE。
+            if(oggFamily &&
+                inStream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                (inStream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                QByteArray mime;
+                if(inStream->attached_pic.size > 0 &&
+                    inStream->attached_pic.data &&
+                    CoverMimeFromCodec(inStream->codecpar->codec_id, mime)) {
+                    const QByteArray imageData(
+                        reinterpret_cast<const char*>(inStream->attached_pic.data),
+                        inStream->attached_pic.size
+                        );
 
-                if(in_stream->attached_pic.size > 0 && in_stream->attached_pic.data) {
-                    std::vector<uint8_t> imgData(in_stream->attached_pic.data,
-                                                 in_stream->attached_pic.data + in_stream->attached_pic.size);
-                    std::string mime;
-                    switch (in_stream->codecpar->codec_id) {
-                    case AV_CODEC_ID_PNG:  mime = "image/png"; break;
-                    case AV_CODEC_ID_BMP:  mime = "image/bmp"; break;
-                    case AV_CODEC_ID_GIF:  mime = "image/gif"; break;
-                    case AV_CODEC_ID_WEBP: mime = "image/webp"; break;
-                    case AV_CODEC_ID_TIFF: mime = "image/tiff"; break;
-                    default: mime = "image/jpeg"; break;
-                    }
-
-                    std::vector<uint8_t> flacBlock;
-                    // 辅助函数：以大端序写入32位整数
-                    auto writeBigEndian32 = [&](uint32_t value) {
-                        flacBlock.push_back((value >> 24) & 0xFF);
-                        flacBlock.push_back((value >> 16) & 0xFF);
-                        flacBlock.push_back((value >> 8) & 0xFF);
-                        flacBlock.push_back(value & 0xFF);
-                    };
-
-                    writeBigEndian32(3);                                          // 封面类型 3 (Front Cover)
-                    writeBigEndian32(mime.length());                              // MIME 字符串长度
-                    flacBlock.insert(flacBlock.end(), mime.begin(), mime.end());  // MIME 字符串内容
-                    writeBigEndian32(0);                                          // 描述字符串长度 (0)
-                    writeBigEndian32(in_stream->codecpar->width);                 // 图像宽
-                    writeBigEndian32(in_stream->codecpar->height);                // 图像高
-                    writeBigEndian32(24);                                         // 颜色深度 (一般设为24)
-                    writeBigEndian32(0);                                          // 索引颜色数 (0)
-                    writeBigEndian32(imgData.size());                             // 图像数据长度
-                    flacBlock.insert(flacBlock.end(), imgData.begin(), imgData.end()); // 图像数据本体
-
-                    // Base64 编码
-                    static const char base64Chars[] =
-                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-                    std::string base64Cover;
-                    base64Cover.reserve(((flacBlock.size() + 2) / 3) * 4);
-
-                    for (size_t j = 0; j < flacBlock.size(); j += 3) {
-                        uint32_t triple = (uint32_t)flacBlock[j] << 16;
-                        if (j + 1 < flacBlock.size()) triple |= (uint32_t)flacBlock[j + 1] << 8;
-                        if (j + 2 < flacBlock.size()) triple |= (uint32_t)flacBlock[j + 2];
-
-                        base64Cover += base64Chars[(triple >> 18) & 0x3F];
-                        base64Cover += base64Chars[(triple >> 12) & 0x3F];
-                        base64Cover += (j + 1 < flacBlock.size()) ? base64Chars[(triple >> 6) & 0x3F] : '=';
-                        base64Cover += (j + 2 < flacBlock.size()) ? base64Chars[triple & 0x3F] : '=';
-                    }
-
-                    preservedBase64Cover = QString::fromStdString(base64Cover);
+                    preservedOggCover = MakeVorbisPictureBlock(
+                        imageData,
+                        mime,
+                        inStream->codecpar->width,
+                        inStream->codecpar->height
+                        );
                 }
-                continue; // 丢弃该流，不再为其创建输出流
+
+                continue;
             }
 
-            AVStream *out_stream = avformat_new_stream(oc, nullptr);
-            if(!out_stream) {
+            AVStream* outStream = avformat_new_stream(oc, nullptr);
+            if(!outStream) {
                 success = false;
                 error = "创建输出流失败";
-                goto cleanup_ffmpeg;
+                goto cleanup;
             }
 
-            ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
+            ret = avcodec_parameters_copy(outStream->codecpar, inStream->codecpar);
             if(ret < 0) {
                 success = false;
-                error = QString("复制流的编解码参数失败：%1").arg(getError(ret));
-                goto cleanup_ffmpeg;
+                error = QString("复制流的编解码参数失败：%1").arg(FFerror(ret));
+                goto cleanup;
             }
 
-            out_stream->time_base = in_stream->time_base;
-            out_stream->disposition = in_stream->disposition;
+            outStream->time_base = inStream->time_base;
+            outStream->disposition = inStream->disposition;
 
-            if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                out_stream->codecpar->codec_tag = 0;
+            // 重封装时音频 codec_tag 置 0，避免 muxer 拒绝旧容器 tag。
+            if(inStream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                outStream->codecpar->codec_tag = 0;
             } else {
-                out_stream->codecpar->codec_tag = in_stream->codecpar->codec_tag;
+                outStream->codecpar->codec_tag = inStream->codecpar->codec_tag;
             }
 
-            av_dict_copy(&out_stream->metadata, in_stream->metadata, 0);
+            av_dict_copy(&outStream->metadata, inStream->metadata, 0);
 
-            stream_mapping[i] = out_stream_index++;
+            streamMapping[static_cast<int>(i)] = outStreamIndex++;
         }
 
-        // 5. 复制音频文件的章节信息
-        if (ic->nb_chapters > 0) {
-            oc->chapters = (AVChapter**)av_calloc(ic->nb_chapters, sizeof(AVChapter*));
+        if(ic->nb_chapters > 0) {
+            oc->chapters = static_cast<AVChapter**>(av_calloc(ic->nb_chapters, sizeof(AVChapter*)));
             if(oc->chapters) {
                 oc->nb_chapters = ic->nb_chapters;
-                for(unsigned int i = 0; i < ic->nb_chapters; i++) {
-                    AVChapter *in_ch = ic->chapters[i];
-                    AVChapter *out_ch = (AVChapter*)av_mallocz(sizeof(AVChapter));
-                    out_ch->id = in_ch->id;
-                    out_ch->time_base = in_ch->time_base;
-                    out_ch->start = in_ch->start;
-                    out_ch->end = in_ch->end;
-                    av_dict_copy(&out_ch->metadata, in_ch->metadata, 0);
-                    oc->chapters[i] = out_ch;
+
+                for(unsigned int i = 0; i < ic->nb_chapters; ++i) {
+                    AVChapter* inChapter = ic->chapters[i];
+                    AVChapter* outChapter = static_cast<AVChapter*>(av_mallocz(sizeof(AVChapter)));
+                    if(!outChapter) continue;
+
+                    outChapter->id = inChapter->id;
+                    outChapter->time_base = inChapter->time_base;
+                    outChapter->start = inChapter->start;
+                    outChapter->end = inChapter->end;
+                    av_dict_copy(&outChapter->metadata, inChapter->metadata, 0);
+
+                    oc->chapters[i] = outChapter;
                 }
             }
         }
 
-        // 6. 处理全局和流级别元数据
+        // 非 OGG 主要使用 global metadata。
+        // OGG 家族同时同步到音频流 metadata，匹配 VorbisComment 的实际存储位置。
         av_dict_copy(&oc->metadata, ic->metadata, 0);
-        applyFuzzyMeta(&oc->metadata, metadata);
+        ApplyFuzzyMeta(&oc->metadata, metadata);
 
-        // 如果拦截到了 OGG 封面，安全地塞入全局 metadata
-        if (isOggFamily && !preservedBase64Cover.isEmpty()) {
-            av_dict_set(&oc->metadata, "METADATA_BLOCK_PICTURE", preservedBase64Cover.toUtf8().constData(), 0);
-        }
-
-        for (unsigned int i = 0; i < oc->nb_streams; i++) {
-            if (oc->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                applyFuzzyMeta(&oc->streams[i]->metadata, metadata);
-                // 规范要求 OGG 流 metadata 也要写入一份
-                if (isOggFamily && !preservedBase64Cover.isEmpty()) {
-                    av_dict_set(&oc->streams[i]->metadata, "METADATA_BLOCK_PICTURE", preservedBase64Cover.toUtf8().constData(), 0);
+        if(oggFamily) {
+            for(unsigned int i = 0; i < oc->nb_streams; ++i) {
+                if(oc->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    ApplyFuzzyMeta(&oc->streams[i]->metadata, metadata);
                 }
+            }
+
+            if(!preservedOggCover.isEmpty()) {
+                SetOggPicture(oc, preservedOggCover);
             }
         }
     }
 
-    // 打开输出文件写入
     if(!(oc->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open2(&oc->pb, finalOutUrl.toUtf8().constData(), AVIO_FLAG_WRITE, nullptr, nullptr);
         if(ret < 0) {
             success = false;
-            error = QString("打开输出文件失败：%1").arg(getError(ret));
-            goto cleanup_ffmpeg;
+            error = QString("打开输出文件失败：%1").arg(FFerror(ret));
+            goto cleanup;
         }
     }
 
-    // 写入文件头
-    ret = avformat_write_header(oc, nullptr);
-    if (ret < 0) {
-        success = false;
-        error = QString("写入文件头失败：%1").arg(getError(ret));
-        goto cleanup_ffmpeg;
+    {
+        AVDictionary* muxerOptions = nullptr;
+        if(IsMp3Format(oc)) {
+            // id3v2_version 是 MP3 muxer option，不是普通 metadata。
+            av_dict_set(&muxerOptions, "id3v2_version", "3", 0);
+        }
+
+        ret = avformat_write_header(oc, &muxerOptions);
+        av_dict_free(&muxerOptions);
+
+        if(ret < 0) {
+            success = false;
+            error = QString("写入文件头失败：%1").arg(FFerror(ret));
+            goto cleanup;
+        }
     }
 
-    // 8. 逐帧读取并写入新文件
     pkt = av_packet_alloc();
+    if(!pkt) {
+        success = false;
+        error = "创建数据包失败";
+        goto cleanup;
+    }
+
     while(true) {
-        if (stopFlag.load(std::memory_order_acquire)) {
+        if(stopFlag.load(std::memory_order_acquire)) {
             success = false;
             error = "用户已中止操作";
             break;
@@ -886,414 +841,300 @@ bool MediaTool::ModifyMetadata(const QString &inputUrl, const QString &outputUrl
 
         ret = av_read_frame(ic, pkt);
         if(ret < 0) {
-            if(ret == AVERROR_EOF) {
-                break;
-            }
+            if(ret == AVERROR_EOF) break;
+
             success = false;
-            error = QString("读取数据帧失败：%1").arg(getError(ret));
+            error = QString("读取数据帧失败：%1").arg(FFerror(ret));
             break;
         }
 
-        int in_stream_index = pkt->stream_index;
-        // 如果是已被丢弃的 OGG 封面流或章节流，映射值为 -1，安全略过
-        if (in_stream_index < 0 || in_stream_index >= stream_mapping.size() || stream_mapping[in_stream_index] < 0) {
+        const int inIndex = pkt->stream_index;
+        if(inIndex < 0 || inIndex >= streamMapping.size() || streamMapping[inIndex] < 0) {
             av_packet_unref(pkt);
             continue;
         }
 
-        pkt->stream_index = stream_mapping[in_stream_index];
+        pkt->stream_index = streamMapping[inIndex];
 
-        AVStream *in_stream = ic->streams[in_stream_index];
-        AVStream *out_stream = oc->streams[pkt->stream_index];
+        AVStream* inStream = ic->streams[inIndex];
+        AVStream* outStream = oc->streams[pkt->stream_index];
 
-        av_packet_rescale_ts(pkt, in_stream->time_base, out_stream->time_base);
+        av_packet_rescale_ts(pkt, inStream->time_base, outStream->time_base);
         pkt->pos = -1;
 
         ret = av_interleaved_write_frame(oc, pkt);
-        if (ret < 0) {
+        if(ret < 0) {
             success = false;
-            error = QString("写入数据帧失败：%1").arg(getError(ret));
+            error = QString("写入数据帧失败：%1").arg(FFerror(ret));
             av_packet_unref(pkt);
             break;
         }
+
         av_packet_unref(pkt);
     }
 
-    // 9. 写入文件尾
-    if (success) {
+    if(success) {
         ret = av_write_trailer(oc);
-        if (ret < 0) {
+        if(ret < 0) {
             success = false;
-            error = QString("写入文件尾失败：%1").arg(getError(ret));
+            error = QString("写入文件尾失败：%1").arg(FFerror(ret));
         }
     }
 
-cleanup_ffmpeg:
-    // ==== 彻底释放句柄 ====
-    if (pkt) av_packet_free(&pkt);
-    if (ic) avformat_close_input(&ic);
-    if (oc && !(oc->oformat->flags & AVFMT_NOFILE)) {
-        avio_closep(&oc->pb);
-    }
-    if (oc) avformat_free_context(oc);
+cleanup:
+    if(pkt) av_packet_free(&pkt);
+    if(ic) avformat_close_input(&ic);
+    if(oc && !(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+    if(oc) avformat_free_context(oc);
 
-
-    // 文件安全替换
-    std::filesystem::path tmpPath;
-#ifdef Q_OS_WIN
-    tmpPath = finalOutUrl.toStdWString();
-#else
-    tmpPath = finalOutUrl.toStdString();
-#endif
-
-    if(inPlace) {
-        if(success) {
-            if(std::filesystem::file_size(tmpPath, ec) == 0 || ec) {
-                success = false;
-                error = "生成的临时文件无效";
-            } else {
-                AVFormatContext* checkCtx = nullptr;
-                // 用 FFmpeg 校验刚生成的文件是否结构完整
-                if(avformat_open_input(&checkCtx, finalOutUrl.toUtf8().constData(), nullptr, nullptr) == 0) {
-                    if(avformat_find_stream_info(checkCtx, nullptr) < 0) {
-                        success = false;
-                        error = "生成的临时文件无效";
-                    }
-                    avformat_close_input(&checkCtx);
-                } else {
-                    success = false;
-                    error = "生成的临时文件无效";
-                }
-            }
-        }
-
-        if (success) {
-            std::filesystem::path backupPath;
-            std::filesystem::path inPath;
-#ifdef Q_OS_WIN
-            backupPath = (inputUrl + ".bak").toStdWString();
-            inPath = inputUrl.toStdWString();
-#else
-            backupPath = (inputUrl + ".bak").toStdString();
-            inPath = inputUrl.toStdString();
-#endif
-
-            // 删除可能存在的上一次残留备份
-            std::filesystem::remove(backupPath, ec);
-            // 将原文件重命名为 xxx.bak
-            std::filesystem::rename(inPath, backupPath, ec);
-            if(!ec) {
-                // 将临时文件重命名为原文件
-                std::filesystem::rename(tmpPath, inPath, ec);
-                if(!ec) {
-                    // 成功替换
-                    std::filesystem::remove(backupPath, ec);
-                }
-                // 重命名失败
-                else {
-                    // 替换失败，回滚
-                    std::filesystem::rename(backupPath, inPath, ec);
-                    std::filesystem::remove(tmpPath, ec);
-                    success = false;
-                    error = "文件替换失败，已自动回滚";
-                }
-            }
-            // 重命名失败
-            else {
-                std::filesystem::remove(tmpPath, ec);
-                success = false;
-                error = "文件可能正在使用";
-            }
-        } else {
-            std::filesystem::remove(tmpPath, ec);
-        }
-    } else {
-        if (!success) {
-            std::filesystem::remove(tmpPath, ec);
-        }
-    }
-    return success;
+    return FinishFileReplace(inputUrl, finalOutUrl, inPlace, success, error);
 }
 
 bool MediaTool::ReplaceCover(const QString &inputUrl, const QString &outputUrl, const QString &imageUrl, QString& error, std::atomic<bool> &stopFlag)
 {
-    auto getError = [](int ret) {
-        char errbuf[1024] = {0};
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        return QString::fromUtf8(errbuf);
-    };
-
-    std::filesystem::path inputPath;
-    std::filesystem::path imagePath;
-#ifdef Q_OS_WIN
-    inputPath = inputUrl.toStdWString();
-    imagePath = imageUrl.toStdWString();
-#else
-    inputPath = inputUrl.toStdString();
-    imagePath = imageUrl.toStdString();
-#endif
-
-    std::error_code ec;
-    if(!std::filesystem::exists(inputPath, ec) || !std::filesystem::is_regular_file(inputPath, ec)) {
+    if(!IsRegularFile(inputUrl)) {
         error = "无效文件";
         return false;
     }
 
-    if(!std::filesystem::exists(imagePath, ec) || !std::filesystem::is_regular_file(imagePath, ec)) {
+    if(!IsRegularFile(imageUrl)) {
         error = "无效图片文件";
         return false;
     }
 
-    bool inPlace = outputUrl.trimmed().isEmpty() || outputUrl == inputUrl;
+    const bool inPlace = outputUrl.trimmed().isEmpty() || outputUrl == inputUrl;
 
     QFileInfo fi(inputUrl);
     QString finalOutUrl = outputUrl;
-    if (inPlace) {
-        QString ext = fi.suffix().isEmpty() ? ".tmp" : ("." + fi.suffix());
+    if(inPlace) {
+        const QString ext = fi.suffix().isEmpty() ? ".tmp" : "." + fi.suffix();
         finalOutUrl = fi.absolutePath() + "/" + fi.completeBaseName() + "_tmp" + ext;
     }
 
-    AVFormatContext *ic_audio = nullptr;
-    AVFormatContext *ic_image = nullptr;
-    AVFormatContext *oc = nullptr;
-    AVPacket *pkt = nullptr;
-    bool success = true;
-    int image_stream_idx = -1;
-    int ret = 0;
+    AVFormatContext* icAudio = nullptr;
+    AVFormatContext* icImage = nullptr;
+    AVFormatContext* oc = nullptr;
+    AVPacket* pkt = nullptr;
+
     QMap<int, int> streamMapping;
+    int imageStreamIndex = -1;
+    bool success = true;
+    int ret = 0;
 
     pkt = av_packet_alloc();
+    if(!pkt) {
+        error = "创建数据包失败";
+        return false;
+    }
 
-    ret = avformat_open_input(&ic_audio, inputUrl.toUtf8().constData(), nullptr, nullptr);
+    ret = avformat_open_input(&icAudio, inputUrl.toUtf8().constData(), nullptr, nullptr);
     if(ret < 0) {
         success = false;
-        error = QString("打开媒体文件失败：%1").arg(getError(ret));
+        error = QString("打开媒体文件失败：%1").arg(FFerror(ret));
         goto cleanup;
     }
 
-    ret = avformat_find_stream_info(ic_audio, nullptr);
+    ret = avformat_find_stream_info(icAudio, nullptr);
     if(ret < 0) {
         success = false;
-        error = QString("读取媒体流信息失败：%1").arg(getError(ret));
+        error = QString("读取媒体流信息失败：%1").arg(FFerror(ret));
         goto cleanup;
     }
 
-    ret = avformat_open_input(&ic_image, imageUrl.toUtf8().constData(), nullptr, nullptr);
+    ret = avformat_open_input(&icImage, imageUrl.toUtf8().constData(), nullptr, nullptr);
     if(ret < 0) {
         success = false;
-        error = QString("打开图片文件失败：%1").arg(getError(ret));
+        error = QString("打开图片文件失败：%1").arg(FFerror(ret));
         goto cleanup;
     }
 
-    ret = avformat_find_stream_info(ic_image, nullptr);
+    ret = avformat_find_stream_info(icImage, nullptr);
     if(ret < 0) {
         success = false;
-        error = QString("读取图片流信息失败：%1").arg(getError(ret));
+        error = QString("读取图片流信息失败：%1").arg(FFerror(ret));
         goto cleanup;
     }
 
     ret = avformat_alloc_output_context2(&oc, nullptr, nullptr, finalOutUrl.toUtf8().constData());
     if(!oc || ret < 0) {
         success = false;
-        error = QString("创建输出上下文失败: %1").arg(getError(ret));
+        error = QString("创建输出上下文失败：%1").arg(FFerror(ret));
         goto cleanup;
     }
 
-    // ================== 1. 构建输出音频流 ==================
-    for (unsigned int i = 0; i < ic_audio->nb_streams; i++) {
-        AVStream *in_stream = ic_audio->streams[i];
+    {
+        const bool oggFamily = IsOggFamily(oc);
 
-        // 【终极必杀】：对于音频文件，我们*只*保留音频流！
-        // 抛弃所有的视频流(旧封面)、数据流(旧章节)、文本流(旧字幕)。
-        // 强行把旧的私有数据流拷过去，100% 会导致 M4A write_header 冲突报错！
-        if(in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            AVStream *out_stream = avformat_new_stream(oc, nullptr);
-            if(!out_stream) {
+        // 封面替换只面向音频文件：复制音频流，丢弃旧 attached_pic 视频流。
+        for(unsigned int i = 0; i < icAudio->nb_streams; ++i) {
+            AVStream* inStream = icAudio->streams[i];
+
+            if(inStream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+                continue;
+            }
+
+            AVStream* outStream = avformat_new_stream(oc, nullptr);
+            if(!outStream) {
                 success = false;
                 error = "创建音频输出流失败";
                 goto cleanup;
             }
 
-            ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
+            ret = avcodec_parameters_copy(outStream->codecpar, inStream->codecpar);
             if(ret < 0) {
                 success = false;
-                error = QString("复制流的编解码参数失败: %1").arg(getError(ret));
+                error = QString("复制音频流参数失败：%1").arg(FFerror(ret));
                 goto cleanup;
             }
 
-            out_stream->time_base = in_stream->time_base;
-            out_stream->disposition = in_stream->disposition;
+            outStream->time_base = inStream->time_base;
+            outStream->disposition = inStream->disposition;
+            outStream->codecpar->codec_tag = 0;
 
-            // 无条件清空 tag，让封装器(如 ipod/mp4)自己分配最标准的标签
-            out_stream->codecpar->codec_tag = 0;
+            av_dict_copy(&outStream->metadata, inStream->metadata, 0);
 
-            av_dict_copy(&out_stream->metadata, in_stream->metadata, 0);
+            // OGG 旧封面在 VorbisComment 中，先清掉，稍后写入新块。
+            if(oggFamily) {
+                av_dict_set(&outStream->metadata, "METADATA_BLOCK_PICTURE", nullptr, 0);
+                av_dict_set(&outStream->metadata, "COVERART", nullptr, 0);
+            }
 
-            // 清理旧的 OGG Base64 封面残留
-            av_dict_set(&out_stream->metadata, "METADATA_BLOCK_PICTURE", nullptr, 0);
-
-            streamMapping[i] = out_stream->index;
+            streamMapping[static_cast<int>(i)] = outStream->index;
         }
-    }
 
-    if (ic_audio->nb_chapters > 0) {
-        oc->chapters = (AVChapter**)av_calloc(ic_audio->nb_chapters, sizeof(AVChapter*));
-        if (oc->chapters) {
-            oc->nb_chapters = ic_audio->nb_chapters;
-            for (unsigned int i = 0; i < ic_audio->nb_chapters; i++) {
-                oc->chapters[i] = (AVChapter*)av_mallocz(sizeof(AVChapter));
-                oc->chapters[i]->id = ic_audio->chapters[i]->id;
-                oc->chapters[i]->time_base = ic_audio->chapters[i]->time_base;
-                oc->chapters[i]->start = ic_audio->chapters[i]->start;
-                oc->chapters[i]->end = ic_audio->chapters[i]->end;
-                av_dict_copy(&oc->chapters[i]->metadata, ic_audio->chapters[i]->metadata, 0);
+        if(streamMapping.isEmpty()) {
+            success = false;
+            error = "未找到可写入的音频流";
+            goto cleanup;
+        }
+
+        if(icAudio->nb_chapters > 0) {
+            oc->chapters = static_cast<AVChapter**>(av_calloc(icAudio->nb_chapters, sizeof(AVChapter*)));
+            if(oc->chapters) {
+                oc->nb_chapters = icAudio->nb_chapters;
+
+                for(unsigned int i = 0; i < icAudio->nb_chapters; ++i) {
+                    AVChapter* inChapter = icAudio->chapters[i];
+                    AVChapter* outChapter = static_cast<AVChapter*>(av_mallocz(sizeof(AVChapter)));
+                    if(!outChapter) continue;
+
+                    outChapter->id = inChapter->id;
+                    outChapter->time_base = inChapter->time_base;
+                    outChapter->start = inChapter->start;
+                    outChapter->end = inChapter->end;
+                    av_dict_copy(&outChapter->metadata, inChapter->metadata, 0);
+
+                    oc->chapters[i] = outChapter;
+                }
             }
         }
-    }
 
-    av_dict_copy(&oc->metadata, ic_audio->metadata, 0);
-    av_dict_set(&oc->metadata, "METADATA_BLOCK_PICTURE", nullptr, 0); // 清理旧残留
+        av_dict_copy(&oc->metadata, icAudio->metadata, 0);
 
-    // ================== 2. 提取并准备新图片 ==================
-    {
-        AVPacket *imgPkt = av_packet_alloc();
-        AVStream *in_img_stream = nullptr;
+        if(oggFamily) {
+            ClearOggPicture(oc);
+        }
+
+        AVPacket* imgPkt = av_packet_alloc();
+        if(!imgPkt) {
+            success = false;
+            error = "创建图片数据包失败";
+            goto cleanup;
+        }
+
+        AVStream* imgStream = nullptr;
         bool gotImage = false;
 
-        while (av_read_frame(ic_image, imgPkt) >= 0) {
-            if(ic_image->streams[imgPkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                in_img_stream = ic_image->streams[imgPkt->stream_index];
+        while(av_read_frame(icImage, imgPkt) >= 0) {
+            AVStream* candidate = icImage->streams[imgPkt->stream_index];
+            if(candidate->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                imgStream = candidate;
                 gotImage = true;
                 break;
             }
+
             av_packet_unref(imgPkt);
         }
 
-        if(!gotImage) {
+        if(!gotImage || !imgStream || imgPkt->size <= 0) {
+            av_packet_free(&imgPkt);
             success = false;
             error = "无效图像数据";
-            av_packet_free(&imgPkt);
             goto cleanup;
         }
 
-        bool useBase64Mode = false;
-        QString outFormatName  = QString::fromUtf8(oc->oformat->name).toLower();
-        useBase64Mode = outFormatName.contains("ogg") || outFormatName.contains("oga") || outFormatName.contains("opus");
-
-        if (useBase64Mode) {
-            // 【Base64 编码模式】：针对 OGG / OPUS
-            std::vector<uint8_t> imgData((const uint8_t*)imgPkt->data,
-                                         (const uint8_t*)imgPkt->data + imgPkt->size);
-
-            std::string mime;
-            switch (in_img_stream->codecpar->codec_id) {
-            case AV_CODEC_ID_PNG:  mime = "image/png"; break;
-            case AV_CODEC_ID_BMP:  mime = "image/bmp"; break;
-            case AV_CODEC_ID_GIF:  mime = "image/gif"; break;
-            case AV_CODEC_ID_WEBP: mime = "image/webp"; break;
-            case AV_CODEC_ID_TIFF: mime = "image/tiff"; break;
-            default: mime = "image/jpeg"; break;
-            }
-
-            // 组装标准的 FLAC Picture Block
-            std::vector<uint8_t> flacBlock;
-
-            // 辅助函数：以大端序写入32位整数
-            auto writeBigEndian32 = [&](uint32_t value) {
-                flacBlock.push_back((value >> 24) & 0xFF);
-                flacBlock.push_back((value >> 16) & 0xFF);
-                flacBlock.push_back((value >> 8) & 0xFF);
-                flacBlock.push_back(value & 0xFF);
-            };
-
-            writeBigEndian32(3);                                          // 封面类型 3 (Front Cover)
-            writeBigEndian32(mime.length());                              // MIME 长度
-            flacBlock.insert(flacBlock.end(), mime.begin(), mime.end());  // MIME 字符串
-            writeBigEndian32(0);                                          // 描述字符串长度
-            writeBigEndian32(in_img_stream->codecpar->width);             // 宽
-            writeBigEndian32(in_img_stream->codecpar->height);            // 高
-            writeBigEndian32(24);                                         // 色深
-            writeBigEndian32(0);                                          // 索引色数
-            writeBigEndian32(imgData.size());                             // 数据长度
-            flacBlock.insert(flacBlock.end(), imgData.begin(), imgData.end()); // 图像数据
-
-            // Base64 编码
-            static const char base64Chars[] =
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-            std::string base64Cover;
-            base64Cover.reserve(((flacBlock.size() + 2) / 3) * 4);
-
-            for (size_t i = 0; i < flacBlock.size(); i += 3) {
-                uint32_t triple = (uint32_t)flacBlock[i] << 16;
-                if (i + 1 < flacBlock.size()) triple |= (uint32_t)flacBlock[i + 1] << 8;
-                if (i + 2 < flacBlock.size()) triple |= (uint32_t)flacBlock[i + 2];
-
-                base64Cover += base64Chars[(triple >> 18) & 0x3F];
-                base64Cover += base64Chars[(triple >> 12) & 0x3F];
-                base64Cover += (i + 1 < flacBlock.size()) ? base64Chars[(triple >> 6) & 0x3F] : '=';
-                base64Cover += (i + 2 < flacBlock.size()) ? base64Chars[triple & 0x3F] : '=';
-            }
-
-            av_dict_set(&oc->metadata, "METADATA_BLOCK_PICTURE", base64Cover.c_str(), 0);
-
-            // 给音频流也注一份（OPUS规范要求）
-            for (unsigned int i = 0; i < oc->nb_streams; i++) {
-                if (oc->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                    av_dict_set(&oc->streams[i]->metadata, "METADATA_BLOCK_PICTURE",
-                                base64Cover.c_str(), 0);
-                }
-            }
-        } else {
-            // 【流混入模式】：针对 MP3 / M4A / MP4 / FLAC
-            AVStream *out_img_stream = avformat_new_stream(oc, nullptr);
-            if(!out_img_stream) {
-                success = false;
-                error = "创建封面输出流失败";
-                av_packet_free(&imgPkt);
-                goto cleanup;
-            }
-
-            ret = avcodec_parameters_copy(out_img_stream->codecpar, in_img_stream->codecpar);
-            if(ret < 0) {
-                success = false;
-                error = QString("复制流的编解码参数失败: %1").arg(getError(ret));
-                av_packet_free(&imgPkt);
-                goto cleanup;
-            }
-
-            out_img_stream->time_base = AVRational{1, 90000}; // 强制净化时间基
-            out_img_stream->codecpar->codec_tag = 0;
-            out_img_stream->disposition |= AV_DISPOSITION_ATTACHED_PIC;
-            image_stream_idx = out_img_stream->index;
+        QByteArray mime;
+        if(!CoverMimeFromCodec(imgStream->codecpar->codec_id, mime)) {
+            av_packet_free(&imgPkt);
+            success = false;
+            error = "仅支持 PNG 或 JPEG 封面图片";
+            goto cleanup;
         }
 
-        // ================== 3. 写入文件头 ==================
+        if(oggFamily) {
+            const QByteArray imageData(reinterpret_cast<const char*>(imgPkt->data), imgPkt->size);
+
+            const QByteArray base64Picture = MakeVorbisPictureBlock(
+                imageData,
+                mime,
+                imgStream->codecpar->width,
+                imgStream->codecpar->height
+            );
+
+            SetOggPicture(oc, base64Picture);
+        } else {
+            AVStream* outImageStream = avformat_new_stream(oc, nullptr);
+            if(!outImageStream) {
+                av_packet_free(&imgPkt);
+                success = false;
+                error = "创建封面输出流失败";
+                goto cleanup;
+            }
+
+            ret = avcodec_parameters_copy(outImageStream->codecpar, imgStream->codecpar);
+            if(ret < 0) {
+                av_packet_free(&imgPkt);
+                success = false;
+                error = QString("复制封面流参数失败：%1").arg(FFerror(ret));
+                goto cleanup;
+            }
+
+            outImageStream->time_base = AVRational{1, 90000};
+            outImageStream->codecpar->codec_tag = 0;
+            outImageStream->disposition |= AV_DISPOSITION_ATTACHED_PIC;
+            imageStreamIndex = outImageStream->index;
+        }
+
         if(!(oc->oformat->flags & AVFMT_NOFILE)) {
             ret = avio_open2(&oc->pb, finalOutUrl.toUtf8().constData(), AVIO_FLAG_WRITE, nullptr, nullptr);
             if(ret < 0) {
-                success = false;
-                error = QString("打开输出文件失败：%1").arg(getError(ret));
                 av_packet_free(&imgPkt);
+                success = false;
+                error = QString("打开输出文件失败：%1").arg(FFerror(ret));
                 goto cleanup;
             }
         }
 
-        if(QString::fromUtf8(oc->oformat->name).contains("mp3"))
-            av_dict_set(&oc->metadata, "id3v2_version", "3", 0);
+        {
+            AVDictionary* muxerOptions = nullptr;
+            if(IsMp3Format(oc)) {
+                // MP3 的 ID3v2 版本是 muxer option，不是普通 metadata。
+                av_dict_set(&muxerOptions, "id3v2_version", "3", 0);
+            }
 
-        ret = avformat_write_header(oc, nullptr);
-        if(ret < 0) {
-            success = false;
-            error = QString("写入文件头失败: %1").arg(getError(ret));
-            av_packet_free(&imgPkt);
-            goto cleanup;
+            ret = avformat_write_header(oc, &muxerOptions);
+            av_dict_free(&muxerOptions);
+
+            if(ret < 0) {
+                av_packet_free(&imgPkt);
+                success = false;
+                error = QString("写入文件头失败：%1").arg(FFerror(ret));
+                goto cleanup;
+            }
         }
 
-
-        // 如果是流模式，把那唯一一帧图片 Packet 写进去
-        if(!useBase64Mode && image_stream_idx != -1 && gotImage) {
-            imgPkt->stream_index = image_stream_idx;
+        if(!oggFamily && imageStreamIndex >= 0) {
+            imgPkt->stream_index = imageStreamIndex;
             imgPkt->pts = 0;
             imgPkt->dts = 0;
             imgPkt->duration = 0;
@@ -1302,38 +1143,40 @@ bool MediaTool::ReplaceCover(const QString &inputUrl, const QString &outputUrl, 
 
             ret = av_interleaved_write_frame(oc, imgPkt);
             if(ret < 0) {
-                success = false;
-                error = QString("写入封面数据失败: %1").arg(getError(ret));
                 av_packet_free(&imgPkt);
+                success = false;
+                error = QString("写入封面数据失败：%1").arg(FFerror(ret));
                 goto cleanup;
             }
         }
+
         av_packet_free(&imgPkt);
     }
 
-    // ================== 4. 混入音频包 ==================
-    while (av_read_frame(ic_audio, pkt) >= 0) {
+    while(av_read_frame(icAudio, pkt) >= 0) {
         if(stopFlag.load(std::memory_order_acquire)) {
             success = false;
             error = "用户已中止操作";
             break;
         }
 
-        if (streamMapping.contains(pkt->stream_index)) {
-            AVStream *in_stream = ic_audio->streams[pkt->stream_index];
-            AVStream *out_stream = oc->streams[streamMapping[pkt->stream_index]];
-            av_packet_rescale_ts(pkt, in_stream->time_base, out_stream->time_base);
+        if(streamMapping.contains(pkt->stream_index)) {
+            AVStream* inStream = icAudio->streams[pkt->stream_index];
+            AVStream* outStream = oc->streams[streamMapping[pkt->stream_index]];
+
+            av_packet_rescale_ts(pkt, inStream->time_base, outStream->time_base);
             pkt->stream_index = streamMapping[pkt->stream_index];
             pkt->pos = -1;
 
             ret = av_interleaved_write_frame(oc, pkt);
             if(ret < 0) {
                 success = false;
-                error = QString("写入音频数据帧失败: %1").arg(getError(ret));
+                error = QString("写入音频数据帧失败：%1").arg(FFerror(ret));
                 av_packet_unref(pkt);
                 break;
             }
         }
+
         av_packet_unref(pkt);
     }
 
@@ -1341,87 +1184,18 @@ bool MediaTool::ReplaceCover(const QString &inputUrl, const QString &outputUrl, 
         ret = av_write_trailer(oc);
         if(ret < 0) {
             success = false;
-            error = QString("写入文件尾失败: %1").arg(getError(ret));
+            error = QString("写入文件尾失败：%1").arg(FFerror(ret));
         }
     }
 
 cleanup:
-    if (pkt) av_packet_free(&pkt);
-    if (ic_audio) avformat_close_input(&ic_audio);
-    if (ic_image) avformat_close_input(&ic_image);
-    if (oc && !(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
-    if (oc) avformat_free_context(oc);
+    if(pkt) av_packet_free(&pkt);
+    if(icAudio) avformat_close_input(&icAudio);
+    if(icImage) avformat_close_input(&icImage);
+    if(oc && !(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+    if(oc) avformat_free_context(oc);
 
-    // 文件安全替换
-    std::filesystem::path tmpPath;
-#ifdef Q_OS_WIN
-    tmpPath = finalOutUrl.toStdWString();
-#else
-    tmpPath = finalOutUrl.toStdString();
-#endif
-    if (inPlace) {
-        std::filesystem::path backupPath;
-        std::filesystem::path inPath;
-#ifdef Q_OS_WIN
-        backupPath = (inputUrl + ".bak").toStdWString();
-        inPath = inputUrl.toStdWString();
-#else
-        backupPath = (inputUrl + ".bak").toStdString();
-        inPath = inputUrl.toStdString();
-#endif
-
-        if (success) {
-            // 校验临时文件有效性
-            if (std::filesystem::file_size(tmpPath, ec) == 0 || ec) {
-                success = false;
-                error = "生成的临时文件无效";
-            } else {
-                // 用 FFmpeg 二次校验文件结构完整性
-                AVFormatContext* checkCtx = nullptr;
-                if (avformat_open_input(&checkCtx, finalOutUrl.toUtf8().constData(), nullptr, nullptr) == 0) {
-                    if (avformat_find_stream_info(checkCtx, nullptr) < 0) {
-                        success = false;
-                        error = "生成的临时文件无效";
-                    }
-                    avformat_close_input(&checkCtx);
-                } else {
-                    success = false;
-                    error = "生成的临时文件无效";
-                }
-            }
-        }
-
-        if (success) {
-            std::filesystem::remove(backupPath, ec);
-            std::filesystem::rename(inPath, backupPath, ec);
-            if (!ec) {
-                std::filesystem::rename(tmpPath, inPath, ec);
-                if (!ec) {
-                    // 成功替换
-                    std::filesystem::remove(backupPath, ec);
-                } else {
-                    // 替换失败，回滚
-                    std::filesystem::rename(backupPath, inPath, ec);
-                    std::filesystem::remove(tmpPath, ec);
-                    success = false;
-                    error = "文件替换失败，已自动回滚";
-                }
-            } else {
-                // 无法备份原文件
-                std::filesystem::remove(tmpPath, ec);
-                success = false;
-                error = "文件可能正在使用";
-            }
-        } else {
-            std::filesystem::remove(tmpPath, ec);
-        }
-    } else {
-        if(!success) {
-            std::filesystem::remove(tmpPath, ec);
-        }
-    }
-
-    return success;
+    return FinishFileReplace(inputUrl, finalOutUrl, inPlace, success, error);
 }
 
 QString MediaTool::CheckHDRFormat(AVColorTransferCharacteristic trc, bool isDOVI, bool isHDR10PLUS, bool isHDR10)
@@ -1531,4 +1305,196 @@ QString MediaTool::FormatLanguage(const QString &langCode, const QString &title)
     }
 
     return QString("%1(%2)").arg(resultLang, resultTitle);
+}
+
+QString MediaTool::FFerror(int ret)
+{
+    char errbuf[1024] = {0};
+    av_strerror(ret, errbuf, sizeof(errbuf));
+    return QString::fromUtf8(errbuf);
+}
+
+bool MediaTool::IsOggFamily(const AVFormatContext *ctx)
+{
+    if(!ctx || !ctx->oformat || !ctx->oformat->name) return false;
+
+    const QString name = QString::fromUtf8(ctx->oformat->name).toLower();
+    return name.contains("ogg") || name.contains("oga") || name.contains("opus");
+}
+
+bool MediaTool::IsMp3Format(const AVFormatContext *ctx)
+{
+    if(!ctx || !ctx->oformat || !ctx->oformat->name) return false;
+
+    const QString name = QString::fromUtf8(ctx->oformat->name).toLower();
+    return name.contains("mp3");
+}
+
+void MediaTool::WriteBe32(std::vector<uint8_t> &buf, uint32_t value)
+{
+    buf.push_back((value >> 24) & 0xFF);
+    buf.push_back((value >> 16) & 0xFF);
+    buf.push_back((value >> 8) & 0xFF);
+    buf.push_back(value & 0xFF);
+}
+
+QByteArray MediaTool::MakeVorbisPictureBlock(const QByteArray &imageData, const QByteArray &mime, int width, int height)
+{
+    std::vector<uint8_t> block;
+
+    WriteBe32(block, 3); // 3 = Front Cover
+    WriteBe32(block, static_cast<uint32_t>(mime.size()));
+    block.insert(block.end(), mime.begin(), mime.end());
+
+    WriteBe32(block, 0); // description length, UTF-8, empty
+
+    // VorbisComment/FLAC picture block 要求这些字段准确或置 0。
+    // width/height 来自 FFmpeg，色深和索引色数这里不深度解析，因此置 0。
+    WriteBe32(block, width > 0 ? static_cast<uint32_t>(width) : 0);
+    WriteBe32(block, height > 0 ? static_cast<uint32_t>(height) : 0);
+    WriteBe32(block, 0); // color depth unknown
+    WriteBe32(block, 0); // indexed colors unknown
+
+    WriteBe32(block, static_cast<uint32_t>(imageData.size()));
+    block.insert(block.end(), imageData.begin(), imageData.end());
+
+    return QByteArray(reinterpret_cast<const char*>(block.data()), static_cast<int>(block.size())).toBase64();
+}
+
+void MediaTool::ClearOggPicture(AVFormatContext *ctx)
+{
+    if(!ctx) return;
+
+    av_dict_set(&ctx->metadata, "METADATA_BLOCK_PICTURE", nullptr, 0);
+    av_dict_set(&ctx->metadata, "COVERART", nullptr, 0);
+
+    for(unsigned int i = 0; i < ctx->nb_streams; ++i) {
+        av_dict_set(&ctx->streams[i]->metadata, "METADATA_BLOCK_PICTURE", nullptr, 0);
+        av_dict_set(&ctx->streams[i]->metadata, "COVERART", nullptr, 0);
+    }
+}
+
+void MediaTool::SetOggPicture(AVFormatContext *ctx, const QByteArray &base64Picture)
+{
+    if(!ctx || base64Picture.isEmpty()) return;
+
+    av_dict_set(&ctx->metadata, "METADATA_BLOCK_PICTURE", base64Picture.constData(), 0);
+
+    for(unsigned int i = 0; i < ctx->nb_streams; ++i) {
+        AVStream *st = ctx->streams[i];
+        if(st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            av_dict_set(&st->metadata, "METADATA_BLOCK_PICTURE", base64Picture.constData(), 0);
+        }
+    }
+}
+
+void MediaTool::ApplyFuzzyMeta(AVDictionary **dict, const QMap<QString, QString> &newMeta)
+{
+    for(auto it = newMeta.constBegin(); it != newMeta.constEnd(); ++it) {
+        QString targetKey = it.key();
+        const QString val = it.value().trimmed();
+
+        AVDictionaryEntry *tag = nullptr;
+        bool found = false;
+
+        while((tag = av_dict_get(*dict, "", tag, AV_DICT_IGNORE_SUFFIX))) {
+            if(QString::fromUtf8(tag->key).compare(targetKey, Qt::CaseInsensitive) == 0) {
+                targetKey = QString::fromUtf8(tag->key);
+                found = true;
+                break;
+            }
+        }
+
+        if(!found && targetKey.compare("lyrics", Qt::CaseInsensitive) == 0) {
+            tag = nullptr;
+            while((tag = av_dict_get(*dict, "", tag, AV_DICT_IGNORE_SUFFIX))) {
+                if(QString::fromUtf8(tag->key).startsWith("lyric", Qt::CaseInsensitive)) {
+                    targetKey = QString::fromUtf8(tag->key);
+                    break;
+                }
+            }
+        }
+
+        if(val.isEmpty()) {
+            av_dict_set(dict, targetKey.toUtf8().constData(), nullptr, 0);
+        } else {
+            av_dict_set(dict, targetKey.toUtf8().constData(), val.toUtf8().constData(), 0);
+        }
+    }
+}
+
+bool MediaTool::ValidateGeneratedFile(const QString &path, QString &error)
+{
+    std::error_code ec;
+    const auto fsPath = ToFsPath(path);
+
+    if(std::filesystem::file_size(fsPath, ec) == 0 || ec) {
+        error = "生成的临时文件无效";
+        return false;
+    }
+
+    AVFormatContext *checkCtx = nullptr;
+    int ret = avformat_open_input(&checkCtx, path.toUtf8().constData(), nullptr, nullptr);
+    if(ret < 0) {
+        error = "生成的临时文件无效";
+        return false;
+    }
+
+    ret = avformat_find_stream_info(checkCtx, nullptr);
+    avformat_close_input(&checkCtx);
+
+    if(ret < 0) {
+        error = "生成的临时文件无效";
+        return false;
+    }
+
+    return true;
+}
+
+bool MediaTool::FinishFileReplace(const QString &inputUrl, const QString &finalOutUrl, bool inPlace, bool success, QString &error)
+{
+    std::error_code ec;
+    const auto tmpPath = ToFsPath(finalOutUrl);
+
+    if(inPlace) {
+        if(success && !ValidateGeneratedFile(finalOutUrl, error)) {
+            success = false;
+        }
+
+        if(success) {
+            const auto inPath = ToFsPath(inputUrl);
+            const auto backupPath = ToFsPath(inputUrl + ".bak");
+
+            std::filesystem::remove(backupPath, ec);
+
+            ec.clear();
+            std::filesystem::rename(inPath, backupPath, ec);
+            if(ec) {
+                std::filesystem::remove(tmpPath, ec);
+                error = "文件可能正在使用";
+                return false;
+            }
+
+            ec.clear();
+            std::filesystem::rename(tmpPath, inPath, ec);
+            if(ec) {
+                std::filesystem::rename(backupPath, inPath, ec);
+                std::filesystem::remove(tmpPath, ec);
+                error = "文件替换失败，已自动回滚";
+                return false;
+            }
+
+            std::filesystem::remove(backupPath, ec);
+            return true;
+        }
+
+        std::filesystem::remove(tmpPath, ec);
+        return false;
+    }
+
+    if(!success) {
+        std::filesystem::remove(tmpPath, ec);
+    }
+
+    return success;
 }

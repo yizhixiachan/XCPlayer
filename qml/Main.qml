@@ -21,10 +21,6 @@ Window {
         NativeEventFilter.SetWindow(window)
         NativeEventFilter.SetVideoDisplay(videoDisplay)
         XCPlayer.StartChecking()
-
-        if(LaunchFile !== "") {
-            XCPlayer.PlayTempUrl(LaunchFile, {})
-        }
     }
     property bool displaying: false
     onDisplayingChanged: {
@@ -99,7 +95,8 @@ Window {
     property bool customBackground: false       // 自定义背景
     property string imageUrl: ""                // 自定义背景路径
     property real imageOpacity: 0.5             // 背景图片透明度
-    property real blurRadius: 25.0              // 背景图片模糊强度
+    property real blurRadius: 75.0              // 背景图片模糊强度
+    property real displayBlurRadius: 75.0       // 背景图片模糊强度
     property bool dynamicEffect: true           // 动态效果
     property bool exclusiveMode: false          // 独占模式
     property bool replayGain: true             // 回放增益
@@ -118,6 +115,7 @@ Window {
         property alias imageUrl: window.imageUrl
         property alias imageOpacity: window.imageOpacity
         property alias blurRadius: window.blurRadius
+        property alias displayBlurRadius: window.displayBlurRadius
         property alias dynamicEffect: window.dynamicEffect
         property alias replayGain: window.replayGain
 
@@ -258,7 +256,7 @@ Window {
                                      if(nextID !== -1) {
                                          XCPlayer.Play(nextID, listID);
                                      } else {
-                                        XCPlayer.Reset()
+                                         XCPlayer.Reset()
                                      }
                                  }
                              }
@@ -346,25 +344,26 @@ Window {
                 height: sourceSize.height
                 visible: false
                 source: {
-                    if(window.displaying) return XCPlayer.largeCover;
-                    if(window.customBackground) return window.imageUrl;
-                    if(window.coverBackground) return XCPlayer.largeCover;
-                    return "";
+                    if(window.displaying) return XCPlayer.largeCover
+                    if(window.customBackground) return window.imageUrl
+                    if(window.coverBackground) return XCPlayer.largeCover
+                    return ""
                 }
                 onSourceChanged: {
                     let colors
                     if(window.displaying || !window.customBackground) {
-                        colors = XCPlayer.GetLargeCoverDominantColors(6);
+                        colors = XCPlayer.GetLargeCoverDominantColors(6)
                     } else {
-                        let originalUrl = window.imageUrl.split("?")[0];
-                        colors = XCPlayer.GetLocalImageDominantColors(originalUrl, 6);
+                        let originalUrl = window.imageUrl.split("?")[0]
+                        colors = XCPlayer.GetLocalImageDominantColors(originalUrl, 6)
                     }
                     if(colors.length >= 6) {
-                        imageBG.gradientColor1 = colors[4];
-                        imageBG.gradientColor2 = colors[5];
+                        imageBG.gradientColor1 = colors[4]
+                        imageBG.gradientColor2 = colors[5]
                     }
-                    pass1.scheduleUpdate();
-                    pass2.scheduleUpdate();
+                    pass1.scheduleUpdate()
+                    pass2.scheduleUpdate()
+                    pass3.scheduleUpdate()
                 }
 
                 fillMode: Image.PreserveAspectCrop
@@ -378,8 +377,8 @@ Window {
                     width: srcImage.width; height: srcImage.height
                     fragmentShader: "qrc:/assets/shaders/blur.frag.qsb"
                     property variant sourceMap: srcImage
-                    property vector2d offset: Qt.vector2d(1.0 / 256.0, 0.0)
-                    property real radius: window.displaying ? 25.0 : window.blurRadius
+                    property vector2d offset: Qt.vector2d(1.0 / srcImage.width, 0.0)
+                    property real radius: window.displaying ? window.displayBlurRadius : window.blurRadius
                     onRadiusChanged: pass1.scheduleUpdate()
                 }
             }
@@ -391,15 +390,27 @@ Window {
                     width: srcImage.width; height: srcImage.height
                     fragmentShader: "qrc:/assets/shaders/blur.frag.qsb"
                     property variant sourceMap: pass1
-                    property vector2d offset: Qt.vector2d(0.0, 1.0 / 256.0)
-                    property real radius: window.displaying ? 25.0 : window.blurRadius
+                    property vector2d offset: Qt.vector2d(0.0, 1.0 / srcImage.height)
+                    property real radius: window.displaying ? window.displayBlurRadius : window.blurRadius
                     onRadiusChanged: pass2.scheduleUpdate()
                 }
             }
-
+            // Pass3 对角线模糊
+            ShaderEffectSource {
+                id: pass3
+                live: false
+                sourceItem: ShaderEffect {
+                    width: srcImage.width; height: srcImage.height
+                    fragmentShader: "qrc:/assets/shaders/blur.frag.qsb"
+                    property variant sourceMap: pass2
+                    property vector2d offset: Qt.vector2d(-0.707 / srcImage.width, 0.707 / srcImage.height)
+                    property real radius: window.displaying ? window.displayBlurRadius * 0.5 : window.blurRadius * 0.5
+                    onRadiusChanged: pass3.scheduleUpdate()
+                }
+            }
             // 最终背景
             ShaderEffect {
-                id: pass3
+                id: pass4
                 anchors.fill: parent
                 fragmentShader: "qrc:/assets/shaders/beautify.frag.qsb"
                 opacity: window.displaying ? 1.0 : window.coverBackground || window.customBackground ? window.imageOpacity
@@ -411,7 +422,7 @@ Window {
                     }
                 }
 
-                property variant sourceMap: pass2
+                property variant sourceMap: pass3
                 property bool dynamicEffect: window.dynamicEffect
                 property real time: 0.0
                 property color color1: imageBG.gradientColor1
@@ -598,13 +609,13 @@ Window {
             onTapped: XCPlayer.SetPause(XCPlayer.isPlaying)
 
             onDoubleTapped: (eventPoint) => {
-                if(window.visibility === Window.FullScreen) {
-                    window.visibility = ctrlBar.prevVisibility
-                } else {
-                    ctrlBar.prevVisibility = window.visibility
-                    window.visibility = Window.FullScreen
-                }
-            }
+                                if(window.visibility === Window.FullScreen) {
+                                    window.visibility = ctrlBar.prevVisibility
+                                } else {
+                                    ctrlBar.prevVisibility = window.visibility
+                                    window.visibility = Window.FullScreen
+                                }
+                            }
         }
 
         Text {

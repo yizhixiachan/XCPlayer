@@ -1415,29 +1415,29 @@ Item {
                         spacing: 4
 
                         // 左旋按钮
-                        Rectangle {
+                        Button {
                             id: rotateLeftBtn
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            radius: 5
-                            color: rotateLeftHover.hovered ? Qt.rgba(63/255, 193/255, 230/255, 0.2)
-                                                           : "transparent"
-                            Behavior on color { ColorAnimation { duration: 200; easing.type: Easing.OutSine } }
 
-                            Text {
-                                anchors.centerIn: parent
+                            contentItem: Text {
                                 text: "↺"
                                 color: "white"
                                 font.pointSize: 16
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
                             }
 
-                            HoverHandler { id: rotateLeftHover; cursorShape: Qt.PointingHandCursor }
-                            TapHandler {
-                                id: rotateLeftTap
-                                onTapped: {
-                                    if(root.externVideoDisplay) {
-                                        root.externVideoDisplay.rotation -= 90
-                                    }
+                            background: Rectangle {
+                                radius: 5
+                                color: rotateLeftBtn.hovered ? Qt.rgba(63/255, 193/255, 230/255, 0.2)
+                                                             : "transparent"
+                                Behavior on color { ColorAnimation { duration: 200; easing.type: Easing.OutSine } }
+                            }
+
+                            onClicked: {
+                                if(root.externVideoDisplay) {
+                                    root.externVideoDisplay.rotation -= 90
                                 }
                             }
                         }
@@ -1462,29 +1462,29 @@ Item {
                         }
 
                         // 右旋按钮
-                        Rectangle {
+                        Button {
                             id: rotateRightBtn
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            radius: 5
-                            color: rotateRightHover.hovered ? Qt.rgba(63/255, 193/255, 230/255, 0.2)
-                                                            : "transparent"
-                            Behavior on color { ColorAnimation { duration: 200; easing.type: Easing.OutSine } }
 
-                            Text {
-                                anchors.centerIn: parent
+                            contentItem: Text {
                                 text: "↻"
                                 color: "white"
                                 font.pointSize: 16
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
                             }
 
-                            HoverHandler { id: rotateRightHover; cursorShape: Qt.PointingHandCursor }
-                            TapHandler {
-                                id: rotateRightTap
-                                onTapped: {
-                                    if(root.externVideoDisplay) {
-                                        root.externVideoDisplay.rotation += 90
-                                    }
+                            background: Rectangle {
+                                radius: 5
+                                color: rotateRightBtn.hovered ? Qt.rgba(63/255, 193/255, 230/255, 0.2)
+                                                              : "transparent"
+                                Behavior on color { ColorAnimation { duration: 200; easing.type: Easing.OutSine } }
+                            }
+
+                            onClicked: {
+                                if(root.externVideoDisplay) {
+                                    root.externVideoDisplay.rotation += 90
                                 }
                             }
                         }
@@ -1497,34 +1497,36 @@ Item {
             }
 
             // 重置按钮
-            Rectangle {
+            Button {
+                id: resetBtn
                 Layout.alignment: Qt.AlignHCenter
                 Layout.topMargin: 15
                 Layout.preferredWidth: 80
                 Layout.preferredHeight: 30
-                radius: 5
-                color: resetHover.hovered ? Qt.rgba(63/255, 193/255, 230/255, 0.4)
-                                          : Qt.rgba(63/255, 193/255, 230/255, 0.1)
-                Behavior on color { ColorAnimation { duration: 200; easing.type: Easing.OutSine } }
-                border.color: "#2B95B3"
 
-                Text {
-                    anchors.centerIn: parent
+                contentItem: Text {
                     text: "恢复默认"
                     color: "white"
                     font.pointSize: 9
                     font.bold: true
                     style: Text.Outline
                     styleColor: "black"
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
                 }
 
-                HoverHandler { id: resetHover; cursorShape: Qt.PointingHandCursor }
-                TapHandler {
-                    onTapped: {
-                        if(root.externVideoDisplay) {
-                            root.externVideoDisplay.ResetFilters()
-                            root.externVideoDisplay.rotation = 0
-                        }
+                background: Rectangle {
+                    radius: 5
+                    color: resetBtn.hovered ? Qt.rgba(63/255, 193/255, 230/255, 0.4)
+                                            : Qt.rgba(63/255, 193/255, 230/255, 0.1)
+                    Behavior on color { ColorAnimation { duration: 200; easing.type: Easing.OutSine } }
+                    border.color: "#2B95B3"
+                }
+
+                onClicked: {
+                    if(root.externVideoDisplay) {
+                        root.externVideoDisplay.ResetFilters()
+                        root.externVideoDisplay.rotation = 0
                     }
                 }
             }

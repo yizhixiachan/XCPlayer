@@ -1,6 +1,7 @@
 #include "XCMediaCore.h"
 #include "XCAudioEngine.h"
 #include <regex>
+#include <fstream>
 extern "C"
 {
 #include "libavfilter/avfilter.h"
@@ -209,6 +210,8 @@ void XCMediaCore::Stop()
     if(videoDecodeThread.joinable()) videoDecodeThread.join();
     if(audioDecodeThread.joinable()) audioDecodeThread.join();
     if(subtitleDecodeThread.joinable()) subtitleDecodeThread.join();
+
+    inputCtxPtr.reset();
 }
 
 void XCMediaCore::OpenAudioStream(int index) {
@@ -235,6 +238,8 @@ void XCMediaCore::SetSpeed(float multiplier) {
     audioClock.SetSpeed(multiplier);
     videoClock.SetSpeed(multiplier);
     externalClock.SetSpeed(multiplier);
+
+    waitCV.notify_all();
 }
 
 float XCMediaCore::GetSpeed() const { return speedTarget.load(std::memory_order_acquire); }

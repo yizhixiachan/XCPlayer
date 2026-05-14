@@ -10,6 +10,7 @@
 #include <QStandardPaths>
 #include <QDir>
 #include <QSettings>
+#include <QCommandLineParser>
 
 int main(int argc, char *argv[])
 {
@@ -19,15 +20,15 @@ int main(int argc, char *argv[])
     QGuiApplication app(argc, argv);
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &XCPlayer::GetInstance(), &XCPlayer::Quit);
 
-    QString launchFile = "";
-    QStringList args = app.arguments();
-    if(args.size() > 1) {
-        // 从 args[1] 开始，用空格拼接所有剩余参数
-        QStringList pathParts;
-        for(int i = 1; i < args.size(); i++) {
-            pathParts.append(args[i]);
-        }
-        launchFile = pathParts.join(" ");
+    QCommandLineParser parser;
+    parser.addPositionalArgument("file", "The file to open.");
+    parser.process(app);
+    const QStringList args = parser.positionalArguments();
+    QString launchFile;
+
+    if(!args.isEmpty()) {
+        launchFile = args.first();
+
         if(!QFile::exists(launchFile)) {
             launchFile.clear();
         }
@@ -44,9 +45,9 @@ int main(int argc, char *argv[])
     // 复用 Qt Quick 底层的 D3D11 Device
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreated,
-        &app,[](QObject *obj, const QUrl &) {
+        &app,[launchFile](QObject *obj, const QUrl &) {
             if(QQuickWindow* window = qobject_cast<QQuickWindow*>(obj)) {
-                QObject::connect(window, &QQuickWindow::beforeRendering, window, [window]() {
+                QObject::connect(window, &QQuickWindow::beforeRendering, window, [window, launchFile]() {
                     static bool d3d_initialized = false;
                     if(!d3d_initialized) {
                         d3d_initialized = true;
@@ -55,26 +56,33 @@ int main(int argc, char *argv[])
                             void* dev = ri->getResource(window, QSGRendererInterface::DeviceResource);
                             XCPlayer::GetInstance().SetD3D11Device(dev);
                         }
+
+                        // 确保 D3D11 Device 就绪后，再触发命令行文件播放
+                        if(!launchFile.isEmpty()) {
+                            QMetaObject::invokeMethod(&XCPlayer::GetInstance(), [launchFile]() {
+                                XCPlayer::GetInstance().PlayTempUrl(launchFile, QVariantMap());
+                            }, Qt::QueuedConnection);
+                        }
                     }
                 });
             }
         },
         Qt::QueuedConnection);
 
-    app.setOrganizationDomain("appXCPlayer");
-    QSettings::setDefaultFormat(QSettings::IniFormat);
-    QSettings::setPath(
-        QSettings::IniFormat,
-        QSettings::UserScope,
-        QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation));
 
-    QString dbPath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/XCPlayer.db";
-    QDir().mkpath(QFileInfo(dbPath).path());
+    app.setOrganizationDomain("appXCPlayer");
+
+    QString rootDataPath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    QDir().mkpath(rootDataPath);
+
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, rootDataPath);
+
+    QString dbPath = rootDataPath + "/XCPlayer.db";
     DatabaseManager::GetInstance().Init(dbPath);
 
     NativeEventFilter eventFilter;
     app.installNativeEventFilter(&eventFilter);
-    engine.rootContext()->setContextProperty("LaunchFile", launchFile);
     engine.rootContext()->setContextProperty("NativeEventFilter", &eventFilter);
     engine.addImageProvider(QString("covers"), new CoverProvider());
     engine.loadFromModule("XCPlayer", "Main");

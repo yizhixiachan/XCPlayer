@@ -121,7 +121,7 @@ QVariantMap XCPlayer::CheckMetadataCapabilities(const QString &url)
     static const QSet<QString> noLyrics = {"wav"};
 
     // 不支持写入内嵌封面的格式
-    static const QSet<QString> noCover = {"wav", "wma"};
+    static const QSet<QString> noCover = {"wav"};
 
     if(noMeta.contains(suffix)) {
         res["canEdit"] = false;
@@ -274,6 +274,7 @@ void XCPlayer::ProcessUrls(const QList<QUrl> &urls, int listID)
         int total = mediaUrls.size();
         if(total == 0) {
             QMetaObject::invokeMethod(this,[this] {
+                UpdateTaskbarProgress(0, 0, true);
                 emit processUrlsFinished({}, false, "未扫描到媒体文件！");
             }, Qt::QueuedConnection);
             bProcessing.store(false, std::memory_order_release);

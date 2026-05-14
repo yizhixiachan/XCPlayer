@@ -609,6 +609,12 @@ Item {
                     HoverHandler {
                         cursorShape: Qt.PointingHandCursor
                     }
+                    WheelHandler {
+                        onWheel: (wheel) => {
+                                     if(wheel.angleDelta.y > 0) sld.increase()
+                                     else if(wheel.angleDelta.y < 0) sld.decrease()
+                                 }
+                    }
 
                     background: Rectangle {
                         x: sld.leftPadding
@@ -702,17 +708,17 @@ Item {
                 Layout.fillWidth: true; spacing: 10
                 Text { text: "外观"; color: "white"; font.pointSize: 15; font.bold: true }
                 SettingsCard {
-                    ColorSelectorRow { featureText: "纯色背景"; descText: "选择喜欢的颜色作为应用背景。" }
+                    ColorSelectorRow { featureText: "纯色背景"; descText: "选择喜欢的颜色作为背景。" }
                     Rectangle { Layout.fillWidth: true; height: 1; Layout.leftMargin: 12; Layout.rightMargin: 12; color: Qt.rgba(1, 1, 1, 0.08) }
 
                     FeatureSwitchRow {
-                        featureText: "封面背景"; descText: "使用当前媒体封面作为应用背景。"
+                        featureText: "封面背景"; descText: "使用当前媒体封面作为背景。"
                         checked: window.coverBackground; onCheckedChanged: window.coverBackground = checked
                     }
                     Rectangle { Layout.fillWidth: true; height: 1; Layout.leftMargin: 12; Layout.rightMargin: 12; color: Qt.rgba(1, 1, 1, 0.08) }
 
                     FeatureSwitchRow {
-                        featureText: "自定义背景"; descText: "选择喜欢的图片作为应用背景。"
+                        featureText: "自定义背景"; descText: "选择喜欢的图片作为背景。"
                         checked: window.customBackground; onCheckedChanged: window.customBackground = checked
                     }
 
@@ -746,7 +752,7 @@ Item {
                     Rectangle { Layout.fillWidth: true; height: 1; Layout.leftMargin: 12; Layout.rightMargin: 12; color: Qt.rgba(1, 1, 1, 0.08) }
 
                     SliderRow {
-                        featureText: "图片透明度"
+                        featureText: "背景图片透明度"
                         descText: "调整背景图片的透明度。"
                         from: 0; to: 1; stepSize: 0.1
                         value: window.imageOpacity
@@ -755,11 +761,20 @@ Item {
                     Rectangle { Layout.fillWidth: true; height: 1; Layout.leftMargin: 12; Layout.rightMargin: 12; color: Qt.rgba(1, 1, 1, 0.08) }
 
                     SliderRow {
-                        featureText: "图片模糊强度"
+                        featureText: "背景图片模糊强度"
                         descText: "调整背景图片的模糊程度。"
-                        from: 0; to: 50; stepSize: 1.0
+                        from: 0; to: 100; stepSize: 1.0
                         value: window.blurRadius
                         onValueChanged: window.blurRadius = value
+                    }
+                    Rectangle { Layout.fillWidth: true; height: 1; Layout.leftMargin: 12; Layout.rightMargin: 12; color: Qt.rgba(1, 1, 1, 0.08) }
+
+                    SliderRow {
+                        featureText: "封面模糊强度"
+                        descText: "调整沉浸播放时的音乐封面模糊程度。"
+                        from: 0; to: 100; stepSize: 1.0
+                        value: window.displayBlurRadius
+                        onValueChanged: window.displayBlurRadius  = value
                     }
                     Rectangle { Layout.fillWidth: true; height: 1; Layout.leftMargin: 12; Layout.rightMargin: 12; color: Qt.rgba(1, 1, 1, 0.08) }
 

@@ -131,7 +131,7 @@ Popup {
     FileDialog {
         id: imageSelectDialog
         title: "选择图片"
-        nameFilters:["图片文件 (*.png *.jpg *.jpeg *.bmp)"]
+        nameFilters:["图片文件 (*.png *.jpg *.jpeg)"]
         onAccepted: XCPlayer.ReplaceCoverAsync(root.currentMediaID, currentFile);
     }
 
@@ -139,7 +139,7 @@ Popup {
         id: coverSaveDialog
         title: "保存图片"
         fileMode: FileDialog.SaveFile
-        nameFilters: ["图片文件 (*.png *.jpg *.jpeg *.bmp)"]
+        nameFilters: ["图片文件 (*.png *.jpg *.jpeg)"]
         defaultSuffix: "png"
         onAccepted: XCPlayer.SaveCover(root.currentMediaID, currentFile);
     }

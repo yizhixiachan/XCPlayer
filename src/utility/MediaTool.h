@@ -33,6 +33,18 @@ private:
     static QString CheckHDRFormat(enum AVColorTransferCharacteristic trc, bool isDOVI, bool isHDR10PLUS, bool isHDR10);
     static void ExtractMetadata(AVDictionary* dict, QMap<QString, QString>& map);
     static QString FormatLanguage(const QString& langCode, const QString& title);
+
+
+    static QString FFerror(int ret);
+    static bool IsOggFamily(const AVFormatContext* ctx);
+    static bool IsMp3Format(const AVFormatContext* ctx);
+    static void WriteBe32(std::vector<uint8_t>& buf, uint32_t value);
+    static QByteArray MakeVorbisPictureBlock(const QByteArray& imageData, const QByteArray& mime, int width, int height);
+    static void ClearOggPicture(AVFormatContext* ctx);
+    static void SetOggPicture(AVFormatContext* ctx, const QByteArray &base64Picture);
+    static void ApplyFuzzyMeta(AVDictionary** dict, const QMap<QString, QString>& newMeta);
+    static bool ValidateGeneratedFile(const QString& path, QString& error);
+    static bool FinishFileReplace(const QString &inputUrl, const QString &finalOutUrl, bool inPlace, bool success, QString &error);
 };
 
 #endif // MEDIATOOL_H

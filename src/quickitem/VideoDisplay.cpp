@@ -23,10 +23,10 @@ VideoDisplay::VideoDisplay(QQuickItem *parent)
 
     connect(&XCPlayer::GetInstance(), &XCPlayer::playInfoChanged, this, [this]() {
         if(XCPlayer::GetInstance().GetPlayInfo().isVideo) {
-            this->videoChanged = true;
-            // 重置旋转
-            this->rotation = 0;
+            videoChanged = true;
+            rotation = 0;
             emit rotationChanged();
+
         }
     });
 }
@@ -170,6 +170,8 @@ void VideoDisplay::PrepareFrame(AVFrame *frame, const std::string &subText)
 void VideoDisplay::Clear()
 {
     QMetaObject::invokeMethod(this, [this]() {
+        subtitleText.clear();
+        emit subtitleTextChanged();
         if(cachedFrame) {
             av_frame_unref(cachedFrame);
         }
