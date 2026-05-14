@@ -12,7 +12,18 @@ Window {
     minimumWidth: 480
     minimumHeight: 480
     visible: true
-    onVisibleChanged: videoDisplay.SetVisibility(window.visible)
+    onVisibleChanged: {
+        if(!visible) {
+            videoDisplay.SetVisibility(false)
+        } else if(displaying && XCPlayer.playInfo.isVideo) {
+            videoDisplay.SetVisibility(true)
+        }
+
+        if(floatingWindow) {
+            miniWindow.hide()
+        }
+    }
+
     title: XCPlayer.playInfo.id !== -1 ? XCPlayer.playInfo.isVideo ? XCPlayer.playInfo.title
                                                                    : XCPlayer.playInfo.title + " - " + XCPlayer.playInfo.artist
     : "XC Player"

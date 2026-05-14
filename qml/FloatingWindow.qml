@@ -37,7 +37,6 @@ Window {
                  }
 
         onDoubleClicked: {
-            root.hide()
             window.show()
             window.raise()
             window.requestActivate()
