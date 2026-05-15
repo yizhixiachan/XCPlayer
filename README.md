@@ -21,7 +21,7 @@ XCPlayer 是一款面向 Windows 桌面的本地音视频播放器，基于 Qt Q
 
 ## 🛠 编译指南
 本项目自带了 Windows 平台的 FFmpeg 开发库（Include & Lib）。
-1. 安装 **Qt 6.9** 或更高版本。
+1. 安装 **Qt 6.8** 或更高版本。
 2. 使用 Qt Creator 打开 `CMakeLists.txt`。
 3. 配置构建工具链并执行构建。
 
