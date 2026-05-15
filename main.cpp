@@ -12,6 +12,18 @@
 #include <QSettings>
 #include <QCommandLineParser>
 
+QString rootDataPath;
+
+// Portable版本的用户数据存在程序目录下的data文件夹中
+QString GetDataPath() {
+    QString appDir = QCoreApplication::applicationDirPath();
+    QDir dir(appDir);
+    if(dir.exists("data")) {
+        return appDir + "/data";
+    }
+    return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+}
+
 int main(int argc, char *argv[])
 {
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11);
@@ -70,16 +82,20 @@ int main(int argc, char *argv[])
         Qt::QueuedConnection);
 
 
-    app.setOrganizationDomain("appXCPlayer");
+    rootDataPath = GetDataPath();
+    if(!QDir().mkpath(rootDataPath) || !QFileInfo(rootDataPath).isWritable()) {
+        rootDataPath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+        QDir().mkpath(rootDataPath);
+    }
 
-    QString rootDataPath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    QDir().mkpath(rootDataPath);
-
+    app.setOrganizationDomain("config");
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, rootDataPath);
 
     QString dbPath = rootDataPath + "/XCPlayer.db";
     DatabaseManager::GetInstance().Init(dbPath);
+
+    CoverManager::GetInstance().Init(rootDataPath);
 
     NativeEventFilter eventFilter;
     app.installNativeEventFilter(&eventFilter);

@@ -25,6 +25,8 @@ public:
         SmallFrame
     };
 
+    void Init(const QString& path);
+
     QPixmap GetCoverSync(int id, const QString& url, CoverSize size);
     bool GetCoverAsync(int id, const QString& url, CoverSize size);
 

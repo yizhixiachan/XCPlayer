@@ -10,14 +10,17 @@
 CoverManager::CoverManager(QObject *parent)
     : QObject(parent)
 {
-    diskCacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    QDir dir;
-    if(!dir.exists(diskCacheDir)) dir.mkpath(diskCacheDir);
-
     // 大约28张300x300 Png图片
     mediumCache.setMaxCost(10 * 1024 * 1024);
     // 大约1000张48x48 Png图片
     smallCache.setMaxCost(10 * 1024 * 1024);
+}
+
+void CoverManager::Init(const QString &path)
+{
+    diskCacheDir = path + "/covers";
+    QDir dir;
+    if(!dir.exists(diskCacheDir)) dir.mkpath(diskCacheDir);
 }
 
 QPixmap CoverManager::GetCoverSync(int id, const QString &url, CoverSize size)
